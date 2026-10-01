@@ -1,0 +1,334 @@
+name: release
+
+# Push a semver tag (v0.1.0, v0.2.0-rc.1, ...) to build, publish and smoke-test
+# a release. The client has cgo code (audio, camera), so each OS builds on its
+# own runner; the server is pure Go and cross-compiles from one.
+#
+# No -ldflags for the version: Go stamps the tag into the binary's build info,
+# but only when building at the tag from a clean tree. So every build job
+# checks out with full history and writes its output to $RUNNER_TEMP, never
+# into the repo (any untracked file turns the version into vX.Y.Z+dirty), and
+# fails if the stamped version isn't exactly the tag.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.ref_name }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  client-macos:
+    name: client (darwin/universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          # Latest 1.26 patch release (go-version-file would pin exactly 1.26.0 and
+          # miss security fixes). Keep in step with the go line in go.mod.
+          go-version: "1.26.x"
+          check-latest: true
+
+      - name: go test
+        run: go test ./...
+
+      - name: Build universal binary
+        env:
+          CGO_ENABLED: "1"
+          # Without this, cgo objects target the runner's macOS version and the
+          # binary won't start on older Macs. Keep it at Go's own minimum
+          # (macOS 12 for Go 1.26; Go 1.27 needs 13.0).
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          out="$RUNNER_TEMP/build"
+          mkdir -p "$out" "$RUNNER_TEMP/dist"
+          GOARCH=arm64 go build -trimpath -o "$out/tincan_arm64" ./cmd/tincan
+          GOARCH=amd64 CC="clang -arch x86_64" go build -trimpath -o "$out/tincan_amd64" ./cmd/tincan
+          for f in "$out/tincan_arm64" "$out/tincan_amd64"; do
+            v=$(go version -m "$f" | awk '$1 == "mod" { print $3 }')
+            [ "$v" = "$TAG" ] || { echo "::error::$f is stamped '$v', want '$TAG'"; exit 1; }
+          done
+          lipo -create -output "$out/tincan" "$out/tincan_arm64" "$out/tincan_amd64"
+          codesign -s - -f "$out/tincan"
+          lipo -info "$out/tincan"
+          "$out/tincan" --version
+          COPYFILE_DISABLE=1 tar -C "$out" -czf "$RUNNER_TEMP/dist/tincan_darwin_universal.tar.gz" tincan
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-client-darwin
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  client-linux:
+    name: client (linux/${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          # The oldest LTS runners, so the binaries need only glibc 2.35.
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          # Latest 1.26 patch release (go-version-file would pin exactly 1.26.0 and
+          # miss security fixes). Keep in step with the go line in go.mod.
+          go-version: "1.26.x"
+          check-latest: true
+
+      - name: go test
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          ASSET: tincan_linux_${{ matrix.arch }}.tar.gz
+        run: |
+          out="$RUNNER_TEMP/build"
+          mkdir -p "$out" "$RUNNER_TEMP/dist"
+          go build -trimpath -o "$out/tincan" ./cmd/tincan
+          v=$(go version -m "$out/tincan" | awk '$1 == "mod" { print $3 }')
+          [ "$v" = "$TAG" ] || { echo "::error::tincan is stamped '$v', want '$TAG'"; exit 1; }
+          "$out/tincan" --version
+          tar -C "$out" -czf "$RUNNER_TEMP/dist/$ASSET" tincan
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-client-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  client-windows:
+    name: client (windows/amd64, best-effort)
+    runs-on: windows-latest
+    # Best-effort: if this fails, the release is published without the zip.
+    continue-on-error: true
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          # Latest 1.26 patch release (go-version-file would pin exactly 1.26.0 and
+          # miss security fixes). Keep in step with the go line in go.mod.
+          go-version: "1.26.x"
+          check-latest: true
+
+      - name: go test
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          gcc --version
+          $out = Join-Path $env:RUNNER_TEMP build
+          $dist = Join-Path $env:RUNNER_TEMP dist
+          New-Item -ItemType Directory -Force -Path $out, $dist | Out-Null
+          go build -trimpath -o "$out\tincan.exe" ./cmd/tincan
+          $v = go version -m "$out\tincan.exe" | ForEach-Object { if ($_ -match '^\s+mod\s+\S+\s+(\S+)') { $Matches[1] } }
+          if ($v -ne $env:TAG) { Write-Output "::error::tincan.exe is stamped '$v', want '$env:TAG'"; exit 1 }
+          & "$out\tincan.exe" --version
+          Compress-Archive -Path "$out\tincan.exe" -DestinationPath "$dist\tincan_windows_amd64.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-client-windows
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  server:
+    name: server (cross-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          # Latest 1.26 patch release (go-version-file would pin exactly 1.26.0 and
+          # miss security fixes). Keep in step with the go line in go.mod.
+          go-version: "1.26.x"
+          check-latest: true
+
+      - name: go test
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist"
+          for goos in linux darwin windows; do
+            for goarch in amd64 arm64; do
+              out="$RUNNER_TEMP/build/${goos}_${goarch}"
+              mkdir -p "$out"
+              exe=tincan-server
+              if [ "$goos" = windows ]; then exe=tincan-server.exe; fi
+              GOOS=$goos GOARCH=$goarch go build -trimpath -o "$out/$exe" ./cmd/tincan-server
+              v=$(go version -m "$out/$exe" | awk '$1 == "mod" { print $3 }')
+              [ "$v" = "$TAG" ] || { echo "::error::$goos/$goarch $exe is stamped '$v', want '$TAG'"; exit 1; }
+              name="tincan-server_${goos}_${goarch}"
+              if [ "$goos" = windows ]; then
+                (cd "$out" && zip -q -X "$dist/$name.zip" "$exe")
+              else
+                tar -C "$out" -czf "$dist/$name.tar.gz" "$exe"
+              fi
+            done
+          done
+          "$RUNNER_TEMP/build/linux_amd64/tincan-server" --version
+          ls -l "$dist"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-server
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [client-macos, client-linux, client-windows, server]
+    # Run even if the best-effort Windows job failed, but never without the
+    # required builds.
+    if: >-
+      ${{ !cancelled()
+      && needs.client-macos.result == 'success'
+      && needs.client-linux.result == 'success'
+      && needs.server.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Check assets and write checksums.txt
+        working-directory: dist
+        run: |
+          missing=0
+          for f in \
+            tincan_darwin_universal.tar.gz \
+            tincan_linux_amd64.tar.gz \
+            tincan_linux_arm64.tar.gz \
+            tincan-server_linux_amd64.tar.gz \
+            tincan-server_linux_arm64.tar.gz \
+            tincan-server_darwin_amd64.tar.gz \
+            tincan-server_darwin_arm64.tar.gz \
+            tincan-server_windows_amd64.zip \
+            tincan-server_windows_arm64.zip
+          do
+            [ -f "$f" ] || { echo "::error::missing release asset $f"; missing=1; }
+          done
+          [ "$missing" = 0 ] || exit 1
+          if [ ! -f tincan_windows_amd64.zip ]; then
+            echo "::warning::tincan_windows_amd64.zip is missing (the Windows build is best-effort); publishing without it"
+          fi
+          sha256sum -- *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -- *.tar.gz *.zip checksums.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run of this workflow: replace the assets.
+            gh release upload "$TAG" --clobber "$@"
+          else
+            # A tag like v0.2.0-rc.1 is a prerelease, which releases/latest
+            # (and so install.sh) skips.
+            case "$TAG" in *-*) set -- --prerelease "$@" ;; esac
+            gh release create "$TAG" --title "$TAG" --generate-notes "$@"
+          fi
+
+  smoke-test:
+    name: smoke test (${{ matrix.os }})
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install client and server with install.sh
+        env:
+          TINCAN_VERSION: ${{ github.ref_name }}
+          TINCAN_INSTALL_DIR: ${{ runner.temp }}/bin
+        run: |
+          sh install.sh
+          sh install.sh --server
+
+      - name: Check versions
+        run: |
+          for b in tincan tincan-server; do
+            v=$("$RUNNER_TEMP/bin/$b" --version)
+            echo "$b --version: $v"
+            case "$v" in
+              *"$TAG"*) ;;
+              *) echo "::error::$b --version doesn't mention $TAG"; exit 1 ;;
+            esac
+          done
+
+      - name: Start a server and ping it
+        timeout-minutes: 3
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          log="$RUNNER_TEMP/server.log"
+          "$bin/tincan-server" --listen 127.0.0.1:7777 --data "$RUNNER_TEMP/data" >"$log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; echo "--- server log"; cat "$log"' EXIT
+          tries=0
+          until grep -q listening "$log"; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::tincan-server exited before it was listening"
+              exit 1
+            fi
+            tries=$((tries + 1))
+            if [ "$tries" -ge 60 ]; then
+              echo "::error::tincan-server wasn't listening after 30s"
+              exit 1
+            fi
+            sleep 0.5
+          done
+          TINCAN_CONFIG_DIR="$RUNNER_TEMP/cfg" "$bin/tincan" ping 127.0.0.1:7777
